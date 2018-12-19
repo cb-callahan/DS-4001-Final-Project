@@ -1,0 +1,401 @@
+---
+title: "Final Project: Classifying Gender on Voice"
+author: "Colleen Callahan"
+date: "12/15/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Here we read in and explored the data. It was already relatively clean with no NAs. We made the feature "label" a factor, with levels "male"" and "female". 
+```{r}
+library(caret)
+library(randomForest)
+voice <- read.csv("voice.csv")
+str(voice)
+summary(voice)
+
+voice$label <- as.factor(voice$label)
+## Fairly clean data; all numerical values except label
+```
+
+We then partitioned the data into a training set and a validation set. 
+```{r}
+## Partition data
+index <- createDataPartition(voice$label, p=0.8, list = FALSE)
+voice_train <- voice[index,]
+voice_validation <- voice[-index,]
+
+```
+
+
+The first model we used was a simple random forest model. The accuracy on our validation set was about 0.9873418. 
+```{r}
+## Random forest model
+voicerf <- randomForest(voice_train[,1:20], voice_train$label, ntree = 50, 
+                          mtry = sqrt(21), importance = TRUE)
+
+pred <- predict(voicerf, voice_validation)
+mean(pred==voice_validation$label) ## 0.9873418
+
+```
+
+Here we used variable importance, backward and forward feature selection to find a subset of features to try with our models. 
+```{r}
+## Feature selection
+library(MASS)
+library(caret)
+varImpPlot(voicerf, type=2)
+modelnull <- glm(label ~ 1, data = voice_train, family = binomial)
+modelfull <- glm(label ~ ., data = voice_train, family = binomial)
+stepAIC(modelfull, direction = "backward", scope=list(upper=modelfull,lower=modelnull),trace = FALSE)
+
+modelnull <- glm(label ~ 1, data = voice_train, family = binomial)
+modelfull <- glm(label ~ ., data = voice_train, family = binomial)
+stepAIC(modelfull, direction = "forward", scope=list(upper=modelfull,lower=modelnull),trace = FALSE)
+
+
+```
+
+Next, we tried the boosting method, first with no feature selection and then using backward and forward feature selection. Our accuracy stayed about the same with and without feature selection, but the runtime was more efficient. 
+```{r}
+## Boosting
+library(adabag)
+adaboost <- boosting(label~ ., data=voice_train, boos=FALSE, mfinal=20)
+
+p <- predict(adaboost,voice_validation)
+1-p$error ## 0.9810127
+
+## Boosting with feature selection
+
+adaboost<-boosting(label~  median + Q25 + Q75 + skew + kurt + sp.ent + 
+    sfm + mode + meanfun + minfun + modindx, data=voice_train, boos=FALSE, mfinal=20) ## backward elimination 
+
+p <- predict(adaboost,voice_validation)
+1-p$error ##  0.9794304
+
+adaboost<-boosting(label~  meanfreq + sd + median + Q25 + Q75 + IQR + 
+    skew + kurt + sp.ent + sfm + mode + centroid + meanfun + 
+    minfun + maxfun + meandom + mindom + maxdom + dfrange + modindx, data=voice_train, boos=FALSE, mfinal=20) ## forward selection
+
+p <- predict(adaboost,voice_validation)
+1-p$error ## 0.9810127
+```
+
+We then tried our random forest model with different feature selection. First we tried using various variable importance cutoffs. Then, we used the subsets of features we found using backward elimination and forward selection Our highest accuracy yet was on the random forest model using backward elimination. 
+```{r}
+## Random forest model with feature selection
+voicerf <- randomForest(label ~ sfm + sp.ent + sd + Q25 + IQR + meanfun, voice_train, ntree=500, mtry=sqrt(10)) ## Variable importance
+
+pred <- predict(voicerf, voice_validation)
+mean(pred==voice_validation$label) ## 0.9794304
+
+voicerf <- randomForest(label ~ median + Q25 + Q75 + skew + kurt + sp.ent + 
++ sfm + mode + meanfun + minfun + modindx, voice_train, ntree = 500, mtry = sqrt(10))
+
+pred <- predict(voicerf, voice_validation)
+mean(pred==voice_validation$label) ## 0.9889241
+
+voicerf <- randomForest(label ~ meanfreq + sd + median + Q25 + Q75 + IQR + 
+    skew + kurt + sp.ent + sfm + mode + centroid + meanfun + 
+    minfun + maxfun + meandom + mindom + maxdom + dfrange + modindx, voice_train, ntree = 500, mtry = sqrt(10))
+
+pred <- predict(voicerf, voice_validation)
+mean(pred==voice_validation$label) ##  0.9810127
+```
+
+Our best model, with an accuracy of 0.988924 was the random forest model with a subset of 11 features. 
+```{r}
+## Best model
+library(randomForest)
+bestrf <- randomForest(label ~ median + Q25 + Q75 + skew + kurt + sp.ent + 
++ sfm + mode + meanfun + minfun + modindx, voice_train, ntree = 500, mtry = sqrt(10))
+
+```
+
+Here we tried tuning our hyperparameters, which did not seem to improve our accuracy too much. 
+```{r}
+## Tuning hyperparameters 
+library(adabag)
+cv_opts <- trainControl(method="cv", number=10)
+Grid <- expand.grid(maxdepth=c(4,5,6,7,8,9,10,11),nu=.01,iter=c(50,100,150,200,250,300))
+
+results_ada <- train(label ~ median + Q25 + Q75 + skew + kurt + sp.ent + 
++ sfm + mode + meanfun + minfun + modindx, voice_train, method="ada", trControl=cv_opts,tuneGrid=Grid)
+
+boost_forest <- boosting(label ~ median + Q25 + Q75 + skew + kurt + sp.ent + 
++ sfm + mode + meanfun + minfun + modindx, voice_train, boos=FALSE, mfinal = 100, maxdepth = 10 )
+
+p <- predict(boost_forest,voice_validation)
+1-p$error ## 0.9810127
+```
+
+
+Here we have included the code that writes a function to extract audio features from audio recordings we created ourselves. This code was found from https://github.com/primaryobjects/voice-gender/blob/master/sound.R#L91-L102.  
+```{r}
+## Writing the function that extracts audio features 
+
+specan3 <- function(X, bp = c(0,22), wl = 2048, threshold = 5, parallel = 1){
+  # To use parallel processing: library(devtools), install_github('nathanvan/parallelsugar')
+  if(class(X) == "data.frame") {if(all(c("sound.files", "selec", 
+                                         "start", "end") %in% colnames(X))) 
+  {
+    start <- as.numeric(unlist(X$start))
+    end <- as.numeric(unlist(X$end))
+    sound.files <- as.character(unlist(X$sound.files))
+    selec <- as.character(unlist(X$selec))
+  } else stop(paste(paste(c("sound.files", "selec", "start", "end")[!(c("sound.files", "selec", 
+                                                                        "start", "end") %in% colnames(X))], collapse=", "), "column(s) not found in data frame"))
+  } else  stop("X is not a data frame")
+  
+  #if there are NAs in start or end stop
+  if(any(is.na(c(end, start)))) stop("NAs found in start and/or end")  
+  
+  #if end or start are not numeric stop
+  if(all(class(end) != "numeric" & class(start) != "numeric")) stop("'end' and 'selec' must be numeric")
+  
+  #if any start higher than end stop
+  if(any(end - start<0)) stop(paste("The start is higher than the end in", length(which(end - start<0)), "case(s)"))  
+  
+  #if any selections longer than 20 secs stop
+  if(any(end - start>20)) stop(paste(length(which(end - start>20)), "selection(s) longer than 20 sec"))  
+  options( show.error.messages = TRUE)
+  
+  #if bp is not vector or length!=2 stop
+  if(!is.vector(bp)) stop("'bp' must be a numeric vector of length 2") else{
+    if(!length(bp) == 2) stop("'bp' must be a numeric vector of length 2")}
+  
+  #return warning if not all sound files were found
+  fs <- list.files(path = getwd(), pattern = ".wav$", ignore.case = TRUE)
+  if(length(unique(sound.files[(sound.files %in% fs)])) != length(unique(sound.files))) 
+    cat(paste(length(unique(sound.files))-length(unique(sound.files[(sound.files %in% fs)])), 
+              ".wav file(s) not found"))
+  
+  #count number of sound files in working directory and if 0 stop
+  d <- which(sound.files %in% fs) 
+  if(length(d) == 0){
+    stop("The .wav files are not in the working directory")
+  }  else {
+    start <- start[d]
+    end <- end[d]
+    selec <- selec[d]
+    sound.files <- sound.files[d]
+  }
+  
+  # If parallel is not numeric
+  if(!is.numeric(parallel)) stop("'parallel' must be a numeric vector of length 1") 
+  if(any(!(parallel %% 1 == 0),parallel < 1)) stop("'parallel' should be a positive integer")
+  
+  # If parallel was called
+  if(parallel > 1)
+  { options(warn = -1)
+    if(all(Sys.info()[1] == "Windows",requireNamespace("parallelsugar", quietly = TRUE) == TRUE)) 
+      lapp <- function(X, FUN) parallelsugar::mclapply(X, FUN, mc.cores = parallel) else
+        if(Sys.info()[1] == "Windows"){ 
+          cat("Windows users need to install the 'parallelsugar' package for parallel computing (you are not doing it now!)")
+          lapp <- pbapply::pblapply} else lapp <- function(X, FUN) parallel::mclapply(X, FUN, mc.cores = parallel)} else lapp <- pbapply::pblapply
+  
+  options(warn = 0)
+  
+  if(parallel == 1) cat("Measuring acoustic parameters:")
+  x <- as.data.frame(lapp(1:length(start), function(i) { 
+    r <- tuneR::readWave(file.path(getwd(), sound.files[i]), from = start[i], to = end[i], units = "seconds") 
+    
+    b<- bp #in case bp its higher than can be due to sampling rate
+    if(b[2] > ceiling(r@samp.rate/2000) - 1) b[2] <- ceiling(r@samp.rate/2000) - 1 
+    
+    
+    #frequency spectrum analysis
+    songspec <- seewave::spec(r, f = r@samp.rate, plot = FALSE)
+    analysis <- seewave::specprop(songspec, f = r@samp.rate, flim = c(0, 280/1000), plot = FALSE)
+    
+    #save parameters
+    meanfreq <- analysis$mean/1000
+    sd <- analysis$sd/1000
+    median <- analysis$median/1000
+    Q25 <- analysis$Q25/1000
+    Q75 <- analysis$Q75/1000
+    IQR <- analysis$IQR/1000
+    skew <- analysis$skewness
+    kurt <- analysis$kurtosis
+    sp.ent <- analysis$sh
+    sfm <- analysis$sfm
+    mode <- analysis$mode/1000
+    centroid <- analysis$cent/1000
+    
+    #Frequency with amplitude peaks
+    peakf <- 0#seewave::fpeaks(songspec, f = r@samp.rate, wl = wl, nmax = 3, plot = FALSE)[1, 1]
+    
+    #Fundamental frequency parameters
+    ff <- seewave::fund(r, f = r@samp.rate, ovlp = 50, threshold = threshold, 
+                        fmax = 280, ylim=c(0, 280/1000), plot = FALSE, wl = wl)[, 2]
+    meanfun<-mean(ff, na.rm = T)
+    minfun<-min(ff, na.rm = T)
+    maxfun<-max(ff, na.rm = T)
+    
+    #Dominant frecuency parameters
+    y <- seewave::dfreq(r, f = r@samp.rate, wl = wl, ylim=c(0, 280/1000), ovlp = 0, plot = F, threshold = threshold, bandpass = b * 1000, fftw = TRUE)[, 2]
+    meandom <- mean(y, na.rm = TRUE)
+    mindom <- min(y, na.rm = TRUE)
+    maxdom <- max(y, na.rm = TRUE)
+    dfrange <- (maxdom - mindom)
+    duration <- (end[i] - start[i])
+    
+    #modulation index calculation
+    changes <- vector()
+    for(j in which(!is.na(y))){
+      change <- abs(y[j] - y[j + 1])
+      changes <- append(changes, change)
+    }
+    if(mindom==maxdom) modindx<-0 else modindx <- mean(changes, na.rm = T)/dfrange
+    
+    #save results
+    return(c(duration, meanfreq, sd, median, Q25, Q75, IQR, skew, kurt, sp.ent, sfm, mode, 
+             centroid, peakf, meanfun, minfun, maxfun, meandom, mindom, maxdom, dfrange, modindx))
+  }))
+  
+  #change result names
+  
+  rownames(x) <- c("duration", "meanfreq", "sd", "median", "Q25", "Q75", "IQR", "skew", "kurt", "sp.ent", 
+                   "sfm","mode", "centroid", "peakf", "meanfun", "minfun", "maxfun", "meandom", "mindom", "maxdom", "dfrange", "modindx")
+  x <- data.frame(sound.files, selec, as.data.frame(t(x)))
+  colnames(x)[1:2] <- c("sound.files", "selec")
+  rownames(x) <- c(1:nrow(x))
+  
+  return(x)
+}
+```
+
+The following code is another function that helps us process the test sets we created and put in folders in our working directory. It was also from https://github.com/primaryobjects/voice-gender/blob/master/sound.R#L91-L102. 
+```{r}
+## Processing audio files 
+processFolder <- function(folderName) {
+  # Start with empty data.frame.
+  data <- data.frame()
+  
+  # Get list of files in the folder.
+  list <- list.files(folderName, '\\.wav')
+  
+  # Add file list to data.frame for processing.
+  for (fileName in list) {
+    row <- data.frame(fileName, 0, 0, 20)
+    data <- rbind(data, row)
+  }
+  
+  # Set column names.
+  names(data) <- c('sound.files', 'selec', 'start', 'end')
+  
+  # Move into folder for processing.
+  setwd(folderName)
+  
+  # Process files.
+  acoustics <- specan3(data, parallel=1)
+  
+  # Move back into parent folder.
+  setwd('..')
+  
+  acoustics
+}
+```
+
+Here we run the best model we found on the test set we created ourselves. We split the test set into four smaller test sets since the runtime for processing one audio file is quite long. The first test set, "test", has 6 conventional voices, 2 female and 4 male. Our random forest model classified all voices correctly. 
+```{r}
+## Running on actual test sets we created ourselves
+
+## First test set - conventional recordings
+test <- processFolder('~/Desktop/Fall 2018/Data Science/test')
+
+test$duration <- NULL
+## test$sound.files <- NULL
+test$selec <- NULL
+test$peakf <- NULL
+
+test.1 <- c('male', 'female', 'male', 'female', 'male', 'male')
+test$label <- test.1
+
+pred <- predict(bestrf, test)
+table(pred, test$label)
+mean(pred==test$label)
+
+```
+
+The next test set we created, "test 2", was of voices 'with distraction.' We had one audio file with a male playing piano and singing, and another audio file of a male speaking, with a female voice interspersed. The model classified the first audio file correctly as male, and the second audio file as male, since the male voice dominated the conversation in the audio file.
+```{r}
+
+## Second test set - singing with piano, two person conversation dominated by male
+
+test2 <-processFolder('~/Desktop/Fall 2018/Data Science/test 2')
+test2$duration <- NULL
+## test$sound.files <- NULL
+test2$selec <- NULL
+test2$peakf <- NULL
+
+test.2 <- c('both', 'male')
+test2$label <- test.2
+
+pred <- predict(bestrf, test2)
+table(pred, test2$label)
+mean(pred==test2$label)
+## Predicted male when two people talking, Joe dominated conversation
+
+```
+
+The next test set, "test 3" explores at what age the model starts correctly classifying male voices. The test set has audio files of males at age 2, 5, 10, 13 and 15. The model started correctly classifying at age 15. 
+```{r}
+
+## Third test set - AGE 
+## male at age 2, 5, 10, 13, 15
+test3 <- processFolder('~/Desktop/Fall 2018/Data Science/test age')
+
+test3$duration <- NULL
+## test$sound.files <- NULL
+test3$selec <- NULL
+test3$peakf <- NULL
+
+test3$label <- 'male'
+test.3 <- c(10, 13, 15, 2, 5)
+test3$age <- test.3
+
+pred <- predict(bestrf, test3)
+table(pred, test3$label)
+mean(pred==test3$label)
+
+## Comparing which age it predicted correctly
+comp <- test3[(colnames(test3)=='label' | colnames(test3) ==  'age')]
+comp$pred <- pred
+comp
+## Predicted correctly starting with age 15 
+
+```
+
+The next test set, 'test 4', deals with atypical voices. There are audio recordings of an intersex male, non conforming intersex person, transgender female, and a transgender male at 1 month, 6 months, and 12 months during the transition. The model predicted the intersex male as male, non conforming intersex person as female, transgender female as female and transgender male as male at all 3 stages in the transition. 
+```{r}
+
+## Fourth test set - ATYPICAL VOICES 
+## transgender female, transgender male at 1 month, 6 month and 1 year of transition, intersex male, intersex non-conforming 
+
+test4 <- processFolder('~/Desktop/Fall 2018/Data Science/test trans')
+test4$duration <- NULL
+test$sound.files <- NULL
+test4$selec <- NULL
+test4$peakf <- NULL
+
+test.4 <- c('male', 'neither', 'female', 'male', 'male', 'male')
+test4$label <- test.4
+test4$gender <- c('intersex male', 'intersex nonconforming', 'trans female', 'trans male (1 mo)', 'trans male (12 mo)', 'trans male (6 mo)')
+
+pred <- predict(bestrf, test4)
+table(pred, test4$label)
+mean(pred==test4$label)
+
+## Comparing how it predicted atypical voices
+comp2 <- test4[(colnames(test4)=='label' | colnames(test4) ==  'gender')]
+comp2$pred <- pred
+comp2
+
+```
+
+Conclusion: Overall, we found our best and most effiencient model to be a random forest model with the following features: median + Q25 + Q75 + skew + kurt + sp.ent + 
++ sfm + mode + meanfun + minfun + modindx. The model did pretty well with conventional voices, with 100% accuracy on the audio files we created ourselves. We wanted to see how our model would do with different ages and atypical voices. The model seems to predict accurately only on adult male and female voices, since the features we used are mostly based on frequency, which changes as males and females get older. Our model also does pretty well on atypical voices, but does not have a separate category for non conforming individuals. If we had more time, it would be interesting to explore our data further and see if there is a way to account for this.
